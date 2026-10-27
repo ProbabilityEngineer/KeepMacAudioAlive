@@ -78,7 +78,7 @@ Acceptance:
 
 Acceptance: the window remains responsive during connection changes and recovery.
 
-Implementation complete; real-device Stop/Quit verification remains manual:
+Implementation complete; user confirmed Stop → Start → Quit → reopen works:
 
 - CoreAudio lifecycle operations remain on one serial queue, with queue
   preconditions on reconciliation, teardown, and retry management.
@@ -123,6 +123,28 @@ Validation:
 
 Acceptance: stopped callbacks cannot leave the UI showing healthy playback
 indefinitely, and recovery cannot create rapid retry loops or duplicate streams.
+
+Implementation complete, pending physical stall/sleep/wake validation:
+
+- Each IOProc owns a C11 atomic heartbeat counter. The callback increments it
+  after zero-filling; no allocation, lock, logging, or dispatch occurs there.
+- The C header requires always-lock-free unsigned long long atomics at compile
+  time, retaining macOS 14.6 compatibility without Swift Synchronization APIs.
+- The lifecycle queue checks progress once per second (200 ms timer leeway).
+  Green is published only after observing callbacks.
+- A five-second startup grace period and three-second no-progress threshold
+  feed stalls through existing serialized teardown and bounded recovery.
+- Retry budget resets after 30 seconds of observed healthy activity, not merely
+  a successful AudioDeviceStart. Explicit user/lifecycle events still reset it.
+- Monitoring stops on teardown, sleep, disable, and Quit. Callback memory is
+  released after IOProc destruction; failed cleanup retains ownership.
+- Policy and heartbeat tests pass for startup grace, stall detection, sustained
+  health, replacement stream reset, counter wraparound, bounded retry budget,
+  and atomic counter operations. Termination tests still pass; Debug build passes.
+- Tests do not inject a real CoreAudio stall or establish physical hum suppression.
+- A blocked lifecycle queue can also delay health checks. This monitor detects
+  missing callbacks when the control queue is operational; it cannot interrupt
+  a permanently blocked driver call. The existing Quit deadline remains in place.
 
 ## 4. Background operation without permanent icons
 

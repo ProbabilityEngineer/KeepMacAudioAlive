@@ -57,8 +57,14 @@ sharing publicly.
   A stop operation begun before sleep and completed after wake therefore needs
   to be interpreted alongside the notification timestamps.
 - `STATE` versus `UI applied`: distinguishes controller progress from UI updates.
-- `Started` still means the start API succeeded, not verified callback activity
-  or physical audio output. Callback-health monitoring is a separate milestone.
+- `Waiting for audio callbacks` means the start API succeeded but callbacks have
+  not yet been observed. `Started` now means the heartbeat has advanced.
+- Health checks run roughly once per second while a stream exists. There is a
+  five-second startup grace period and a three-second no-progress threshold
+  after callbacks begin. Timer scheduling/leeway can delay detection slightly.
+- Stalls trigger teardown and bounded retries. Thirty seconds of observed
+  healthy activity resets the retry budget; API startup alone does not.
+- Callback activity does not establish that physical audio output is quiet.
 
 Disk writes occur asynchronously on a separate queue. This allows notification
 events and operation beginnings to reach the log even when the audio-control
@@ -89,4 +95,10 @@ Non-hardware termination-coordination checks:
 
 ```sh
 bash scripts/test-termination.sh
+```
+
+Non-hardware callback-health and retry-budget checks:
+
+```sh
+bash scripts/test-stream-health.sh
 ```

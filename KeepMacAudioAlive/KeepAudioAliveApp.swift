@@ -159,6 +159,49 @@ final class AudioEngine: ObservableObject {
     }
 }
 
+// Pure health policy, with injected time for deterministic tests. A callback
+// heartbeat establishes activity, not that physical speakers are silent.
+nonisolated struct StreamHealth {
+    enum Observation { case waiting, active, stalled }
+    private var count: UInt64 = 0
+    private var lastProgress: Double
+    private var firstProgress: Double?
+    private(set) var isActive = false
+
+    init(now: Double) { lastProgress = now }
+
+    mutating func observe(count: UInt64, now: Double) -> Observation {
+        if count != self.count {
+            self.count = count
+            lastProgress = now
+            if firstProgress == nil { firstProgress = now }
+            isActive = true
+            return .active
+        }
+        let limit = firstProgress == nil ? 5.0 : 3.0
+        if now - lastProgress >= limit {
+            isActive = false
+            return .stalled
+        }
+        return isActive ? .active : .waiting
+    }
+
+    func isStable(now: Double) -> Bool {
+        isActive && firstProgress.map { now - $0 >= 30 } == true
+    }
+}
+
+nonisolated struct RecoveryBudget {
+    private(set) var attempts = 0
+    private let delays: [Double] = [0.5, 1, 2, 4, 8]
+    mutating func reset() { attempts = 0 }
+    mutating func nextDelay() -> Double? {
+        guard attempts < delays.count else { return nil }
+        defer { attempts += 1 }
+        return delays[attempts]
+    }
+}
+
 // All mutable lifecycle state below is owned by queue. The render callback never
 // touches it. Nonisolated opts out of this project's default MainActor isolation.
 nonisolated private final class AudioController: @unchecked Sendable {
@@ -170,12 +213,14 @@ nonisolated private final class AudioController: @unchecked Sendable {
     private var sleeping = false
     private var closed = false
     private var devices: [AudioEngine.AudioDevice] = []
-    private var stream: (device: AudioDeviceID, uid: String, proc: AudioDeviceIOProcID)?
+    private var stream: (device: AudioDeviceID, uid: String, proc: AudioDeviceIOProcID,
+                         heartbeat: UnsafeMutableRawPointer)?
+    private var health: StreamHealth?
+    private var healthTimer: DispatchSourceTimer?
     private var teardownRequired = false
     private var generation = 0
     private var retry: DispatchWorkItem?
-    private var retryIndex = 0
-    private let retryDelays: [Double] = [0.5, 1, 2, 4, 8]
+    private var recoveryBudget = RecoveryBudget()
 
     private static var deviceListAddress: AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(
@@ -270,7 +315,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
         generation += 1
         retry?.cancel()
         retry = nil
-        retryIndex = 0
+        recoveryBudget.reset()
     }
 
     private func reconcile() {
@@ -306,21 +351,27 @@ nonisolated private final class AudioController: @unchecked Sendable {
             return
         }
         if stream != nil {
-            publish("Started", running: true)
+            checkHealth()
             return
         }
         publish("Connecting", running: false)
+        guard let heartbeat = KMAHeartbeatCreate() else {
+            DiagnosticLog.event("ERROR heartbeat allocation failed")
+            scheduleRetry()
+            return
+        }
         var proc: AudioDeviceIOProcID?
         let created = DiagnosticLog.measure("AudioDeviceCreateIOProcID device=\(target.id)") {
-            AudioDeviceCreateIOProcID(target.id, Self.render, nil, &proc)
+            AudioDeviceCreateIOProcID(target.id, Self.render, heartbeat, &proc)
         }
         guard created == noErr, let proc else {
             log("Create IOProc", created)
+            KMAHeartbeatDestroy(heartbeat)
             scheduleRetry()
             return
         }
         // Own the resource before starting, so every failure path can release it.
-        stream = (target.id, target.uid, proc)
+        stream = (target.id, target.uid, proc, heartbeat)
         let started = DiagnosticLog.measure("AudioDeviceStart device=\(target.id)") {
             AudioDeviceStart(target.id, proc)
         }
@@ -330,13 +381,43 @@ nonisolated private final class AudioController: @unchecked Sendable {
             scheduleRetry()
             return
         }
-        retryIndex = 0
-        publish("Started", running: true)
+        // Do not reset retry budget merely because the start API succeeded.
+        health = StreamHealth(now: ProcessInfo.processInfo.systemUptime)
+        publish("Waiting for audio callbacks", running: false)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
+        timer.setEventHandler { [weak self] in self?.checkHealth() }
+        healthTimer = timer
+        timer.resume()
+    }
+
+    private func checkHealth() {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard enabled, !sleeping, !closed, !teardownRequired,
+              let stream, var health else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let wasActive = health.isActive
+        let result = health.observe(count: KMAHeartbeatRead(stream.heartbeat), now: now)
+        self.health = health
+        switch result {
+        case .waiting:
+            break
+        case .active:
+            if !wasActive { publish("Started", running: true) }
+            if health.isStable(now: now) { recoveryBudget.reset() }
+        case .stalled:
+            publish("Audio callbacks stalled; recovering", running: false)
+            guard tearDown() else { return }
+            scheduleRetry()
+        }
     }
 
     @discardableResult
     private func tearDown() -> Bool {
         dispatchPrecondition(condition: .onQueue(queue))
+        healthTimer?.cancel()
+        healthTimer = nil
+        health = nil
         guard let stream else { return true }
         teardownRequired = true
         let stopped = DiagnosticLog.measure("AudioDeviceStop device=\(stream.device)") {
@@ -354,6 +435,9 @@ nonisolated private final class AudioController: @unchecked Sendable {
             return false
         }
         self.stream = nil
+        // Destroy only after the IOProc has been removed, never while it could
+        // still call into this memory. Failed cleanup retains both resources.
+        KMAHeartbeatDestroy(stream.heartbeat)
         teardownRequired = false
         return true
     }
@@ -361,17 +445,15 @@ nonisolated private final class AudioController: @unchecked Sendable {
     private func scheduleRetry() {
         dispatchPrecondition(condition: .onQueue(queue))
         guard enabled, !sleeping, !closed, retry == nil else { return }
-        guard retryIndex < retryDelays.count else {
+        guard let delay = recoveryBudget.nextDelay() else {
             publish("Recovery failed; retry Stop/Start", running: false)
             return
         }
-        let delay = retryDelays[retryIndex]
-        retryIndex += 1
         let token = generation
         publish("Retrying in \(delay)s", running: false)
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.generation == token, !self.closed else { return }
-            DiagnosticLog.event("Retry executing generation=\(token) attempt=\(self.retryIndex)")
+            DiagnosticLog.event("Retry executing generation=\(token) attempt=\(self.recoveryBudget.attempts)")
             self.retry = nil
             self.reconcile()
         }
@@ -436,25 +518,42 @@ nonisolated private final class AudioController: @unchecked Sendable {
         return value.takeRetainedValue() as String
     }
 
-    private static let render: AudioDeviceIOProc = { _, _, _, _, output, _, _ in
+    private static let render: AudioDeviceIOProc = { _, _, _, _, output, _, context in
         for buffer in UnsafeMutableAudioBufferListPointer(output) {
             if let data = buffer.mData, buffer.mDataByteSize > 0 {
                 memset(data, 0, Int(buffer.mDataByteSize))
             }
         }
+        if let context { KMAHeartbeatTick(context) }
         return noErr
     }
 }
 
 struct ContentView: View {
     @EnvironmentObject var engine: AudioEngine
+    @State private var showCancelAutomaticStart = false
+
+    private var isAwaitingAutomaticStart: Bool {
+        engine.isEnabled && !engine.isRunning && !engine.isShuttingDown
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Image(systemName: "waveform.circle.fill")
-                    .foregroundColor(engine.isRunning ? .green : .secondary)
-                    .font(.title2)
+                Group {
+                    if isAwaitingAutomaticStart &&
+                        (engine.status == "Connecting" ||
+                         engine.status == "Waking" ||
+                         engine.status == "Waiting for audio callbacks") {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "waveform.circle.fill")
+                            .foregroundColor(engine.isRunning ? .green : .secondary)
+                            .font(.title2)
+                    }
+                }
+                .frame(width: 24, height: 24)
                 Button(action: { engine.isRunning ? engine.stop() : engine.start() }) {
                     Text(engine.isRunning ? "Stop" : "Start")
                         .frame(width: 50)
@@ -474,12 +573,14 @@ struct ContentView: View {
                 .frame(width: 200)
                 .disabled(engine.isRunning)
             }
-            if engine.status != "Started" && engine.status != "Disabled" {
+            if engine.status != "Started" && engine.status != "Disabled" &&
+                engine.status != "Waiting for audio callbacks" &&
+                engine.status != "Connecting" && engine.status != "Waking" {
                 Text(engine.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if engine.isEnabled && !engine.isRunning {
+            if isAwaitingAutomaticStart && showCancelAutomaticStart {
                 Button("Cancel automatic start") { engine.stop() }
                     .font(.caption)
             }
@@ -487,6 +588,17 @@ struct ContentView: View {
         .padding(16)
         .fixedSize()
         .disabled(engine.isShuttingDown)
+        .task(id: isAwaitingAutomaticStart) {
+            showCancelAutomaticStart = false
+            guard isAwaitingAutomaticStart else { return }
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            showCancelAutomaticStart = true
+        }
     }
 }
 
