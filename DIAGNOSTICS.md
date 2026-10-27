@@ -67,3 +67,26 @@ is performed inside the real-time audio callback.
 
 A process sample may show where this application's threads are waiting. It
 cannot by itself establish why Bluetooth froze or reveal all kernel/driver work.
+
+## Stop and Quit verification
+
+Quit now explicitly requests cleanup and allows up to five seconds before
+permitting process exit if cleanup is blocked. The timeout is not a claim that
+CoreAudio released resources successfully.
+
+After starting the new build:
+
+1. Click Stop. The window should stay responsive, the indicator should clear,
+   and logs should show stop/destroy completion. Start should work again.
+2. Quit using Command-Q or the application menu. Normal cleanup should finish
+   quickly; logs should show listener removal and `Shutdown cleanup finished`.
+3. Check `pgrep -fl KeepMacAudioAlive` to confirm process exit.
+4. Reopen the app and confirm silence resumes.
+5. If Quit takes five seconds, preserve the logs. The timeout is also sent to
+   the system console because a blocked logging queue might not write its file.
+
+Non-hardware termination-coordination checks:
+
+```sh
+bash scripts/test-termination.sh
+```

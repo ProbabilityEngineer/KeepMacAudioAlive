@@ -14,6 +14,10 @@ nonisolated private enum DiagnosticLog {
     private static let previous = directory.appendingPathComponent("lifecycle.previous.log")
     private static let limit = 2 * 1024 * 1024
 
+    static func flush(completion: @escaping @Sendable () -> Void) {
+        writer.async { completion() }
+    }
+
     static func event(_ message: String) {
         // Capture the event time here, not when the asynchronous write executes.
         let date = Date()
@@ -71,8 +75,10 @@ final class AudioEngine: ObservableObject {
     @Published private(set) var isEnabled = true
     @Published private(set) var devices: [AudioDevice] = []
     @Published private(set) var status = "Connecting"
+    @Published private(set) var isShuttingDown = false
     @Published var selectedDeviceUID: String? {
         didSet {
+            guard !isShuttingDown else { return }
             UserDefaults.standard.set(selectedDeviceUID, forKey: "LastSelectedDeviceUID")
             controller.select(selectedDeviceUID)
         }
@@ -92,7 +98,7 @@ final class AudioEngine: ObservableObject {
         selectedDeviceUID = UserDefaults.standard.string(forKey: "LastSelectedDeviceUID")
         controller.report = { [weak self] devices, running, status in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.isShuttingDown else { return }
                 self.devices = devices
                 self.isRunning = running
                 self.status = status
@@ -126,15 +132,30 @@ final class AudioEngine: ObservableObject {
     }
 
     func start() {
+        guard !isShuttingDown else { return }
         DiagnosticLog.event("USER Start")
         isEnabled = true
         controller.setEnabled(true)
     }
 
     func stop() {
+        guard !isShuttingDown else { return }
         DiagnosticLog.event("USER Stop")
         isEnabled = false
         controller.setEnabled(false)
+    }
+
+    func shutdown(completion: @escaping @Sendable () -> Void) {
+        isShuttingDown = true
+        isEnabled = false
+        isRunning = false
+        status = "Quitting"
+        for observer in observers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        observers.removeAll()
+        DiagnosticLog.event("Workspace observers removed; shutdown requested")
+        controller.shutdown(completion: completion)
     }
 }
 
@@ -218,21 +239,34 @@ nonisolated private final class AudioController: @unchecked Sendable {
         }
     }
 
-    func shutdown() {
+    func shutdown(completion: @escaping @Sendable () -> Void = {}) {
         queue.async {
+            guard !self.closed else {
+                completion()
+                return
+            }
+            DiagnosticLog.event("Shutdown executing on lifecycle queue")
             self.closed = true
+            self.enabled = false
             self.invalidateRetries()
             if let listener = self.listener {
                 var address = Self.deviceListAddress
-                self.log("Remove device listener", AudioObjectRemovePropertyListenerBlock(
-                    AudioObjectID(kAudioObjectSystemObject), &address, self.queue, listener))
+                let result = DiagnosticLog.measure("Remove device listener") {
+                    AudioObjectRemovePropertyListenerBlock(
+                        AudioObjectID(kAudioObjectSystemObject), &address, self.queue, listener)
+                }
+                self.log("Remove device listener", result)
                 self.listener = nil
             }
-            _ = self.tearDown()
+            let cleaned = self.tearDown()
+            self.report = nil
+            DiagnosticLog.event("Shutdown cleanup finished resourcesReleased=\(cleaned)")
+            DiagnosticLog.flush(completion: completion)
         }
     }
 
     private func invalidateRetries() {
+        dispatchPrecondition(condition: .onQueue(queue))
         generation += 1
         retry?.cancel()
         retry = nil
@@ -240,13 +274,16 @@ nonisolated private final class AudioController: @unchecked Sendable {
     }
 
     private func reconcile() {
+        dispatchPrecondition(condition: .onQueue(queue))
         guard !closed else { return }
         if teardownRequired {
             guard tearDown() else { return }
         }
         if sleeping || !enabled {
-            publish(sleeping ? "Sleeping" : "Disabled", running: false)
-            _ = tearDown()
+            publish(sleeping ? "Sleeping" : "Stopping", running: false)
+            if tearDown() {
+                publish(sleeping ? "Sleeping" : "Disabled", running: false)
+            }
             return
         }
         do {
@@ -299,6 +336,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
 
     @discardableResult
     private func tearDown() -> Bool {
+        dispatchPrecondition(condition: .onQueue(queue))
         guard let stream else { return true }
         teardownRequired = true
         let stopped = DiagnosticLog.measure("AudioDeviceStop device=\(stream.device)") {
@@ -321,6 +359,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
     }
 
     private func scheduleRetry() {
+        dispatchPrecondition(condition: .onQueue(queue))
         guard enabled, !sleeping, !closed, retry == nil else { return }
         guard retryIndex < retryDelays.count else {
             publish("Recovery failed; retry Stop/Start", running: false)
@@ -447,17 +486,78 @@ struct ContentView: View {
         }
         .padding(16)
         .fixedSize()
+        .disabled(engine.isShuttingDown)
     }
 }
 
+// Testable one-shot gate: graceful completion and deadline must never both reply.
+@MainActor
+final class TerminationCoordinator {
+    private var started = false
+    private var finished = false
+    private var deadline: DispatchWorkItem?
+
+    func begin(
+        cleanup: (@escaping @Sendable () -> Void) -> Void,
+        schedule: (DispatchWorkItem) -> Void = {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: $0)
+        },
+        reply: @escaping (Bool) -> Void
+    ) {
+        guard !started else { return }
+        started = true
+        let timeout = DispatchWorkItem { [weak self] in
+            self?.finish(timedOut: true, reply: reply)
+        }
+        deadline = timeout
+        schedule(timeout)
+        cleanup { [weak self] in
+            DispatchQueue.main.async {
+                self?.finish(timedOut: false, reply: reply)
+            }
+        }
+    }
+
+    private func finish(timedOut: Bool, reply: (Bool) -> Void) {
+        guard !finished else { return }
+        finished = true
+        deadline?.cancel()
+        deadline = nil
+        reply(timedOut)
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let engine = AudioEngine()
+    private let termination = TerminationCoordinator()
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        termination.begin(cleanup: { completion in
+            engine.shutdown(completion: completion)
+        }, reply: { timedOut in
+            if timedOut {
+                // Do not call CoreAudio concurrently to interrupt a stuck call.
+                // Process exit is the fallback; it is not graceful cleanup.
+                DiagnosticLog.event("QUIT deadline exceeded; exiting without confirmed cleanup")
+                NSLog("KeepMacAudioAlive: cleanup exceeded five seconds; allowing process exit")
+            }
+            sender.reply(toApplicationShouldTerminate: true)
+        })
+        return .terminateLater
+    }
+}
+
+#if !LIFECYCLE_TESTS
 @main
 struct AudioKeepAliveApp: App {
-    @StateObject var engine = AudioEngine()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
         WindowGroup("Keep Mac Audio Alive") {
-            ContentView().environmentObject(engine)
+            ContentView().environmentObject(delegate.engine)
         }
         .windowResizability(.contentSize)
     }
 }
+#endif

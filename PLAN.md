@@ -78,6 +78,36 @@ Acceptance:
 
 Acceptance: the window remains responsive during connection changes and recovery.
 
+Implementation complete; real-device Stop/Quit verification remains manual:
+
+- CoreAudio lifecycle operations remain on one serial queue, with queue
+  preconditions on reconciliation, teardown, and retry management.
+- AppKit's termination delegate now requests asynchronous shutdown explicitly,
+  rather than relying on SwiftUI object deinitialization at process exit.
+- Shutdown removes workspace observers, cancels pending retries, removes the
+  device listener, tears down the stream, and drains pending diagnostic writes.
+- UI controls and late status updates are disabled/ignored during shutdown.
+- Stop reports Stopping until teardown finishes; cleanup failures remain visible.
+- Quit has a five-second deadline. If a driver call or logging blocks, termination
+  is allowed without claiming graceful cleanup. No concurrent CoreAudio call is
+  used to attempt cancellation of the blocked call.
+- A one-shot termination coordinator prevents duplicate replies from repeated
+  Quit requests, timeout, or late cleanup completion.
+
+Validation:
+
+- `bash scripts/test-termination.sh` passes tests for graceful completion,
+  deadline cancellation, repeated Quit, blocked cleanup, and late completion.
+  These exercise termination coordination without opening an audio device.
+- Debug Xcode build succeeds. No sleep/disconnection or application termination
+  was triggered during implementation.
+- Existing diagnostic log contains three sleep/wake cycles with lifecycle queue
+  waits below 0.1 ms; longest completed measured audio call was about 50 ms.
+  These logs do not reproduce or explain the earlier 20-second delay or Bluetooth
+  freeze. Those remain open investigations if they recur.
+- Device-specific cleanup failures, actual AppKit Quit integration, and UI
+  responsiveness during physical transitions still require manual testing.
+
 ## 3. Stream activity and truthful status
 
 - Record callback activity using a verified real-time-safe synchronization
