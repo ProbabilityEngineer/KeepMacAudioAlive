@@ -162,6 +162,25 @@ Implementation complete, pending physical stall/sleep/wake validation:
 Acceptance: no permanent Dock/menu-bar icon, accessible controls on reopening,
 and predictable close-versus-quit behaviour.
 
+Implemented for preview; manual UI/login validation pending:
+
+- Generated app Info.plist sets LSUIElement. No Dock icon; menu-bar icon defaults
+  off and is controlled by a persisted setting.
+- AppDelegate owns one retained, reopenable controls window. Closing it does
+  not terminate audio. Finder/Spotlight reopening activates it.
+- Expandable Settings contains Launch at login and Show menu-bar icon toggles.
+- Login registration uses SMAppService.mainApp, reads actual registration state,
+  displays errors, and links to Login Items when approval is needed.
+- Login-item launch detection suppresses the initial window. Ordinary launches
+  show controls. Install a stable signed app in Applications before login testing.
+- Optional menu exposes Open, Start/Stop, cancellation while waiting, Settings,
+  and Quit. The controls window always includes an explicit Quit button.
+- Existing termination and stream-health tests pass. Debug build passes and its
+  generated Info.plist was verified to contain LSUIElement=true.
+- No login item was registered/unregistered or app launched during implementation.
+- Validate expansion/window resizing, icon toggling, close/reopen, Quit, and
+  actual login startup on the installed build before marking acceptance complete.
+
 ## Validation strategy
 
 - Build after each milestone and review diagnostics.

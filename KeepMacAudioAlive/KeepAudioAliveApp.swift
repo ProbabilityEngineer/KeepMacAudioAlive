@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreAudio
 import AppKit
+import ServiceManagement
 internal import Combine
 
 // Never called from the audio render callback. Disk writes have their own queue,
@@ -529,8 +530,55 @@ nonisolated private final class AudioController: @unchecked Sendable {
     }
 }
 
+@MainActor
+final class AppPreferences: ObservableObject {
+    @Published var settingsExpanded = false
+    @Published var showMenuBarIcon = UserDefaults.standard.bool(forKey: "ShowMenuBarIcon") {
+        didSet {
+            UserDefaults.standard.set(showMenuBarIcon, forKey: "ShowMenuBarIcon")
+            menuVisibilityChanged?()
+        }
+    }
+    @Published private(set) var launchAtLogin = false
+    @Published private(set) var needsApproval = false
+    @Published private(set) var updatingLogin = false
+    @Published private(set) var loginError: String?
+    var menuVisibilityChanged: (() -> Void)?
+
+    init() { refreshLoginStatus() }
+
+    func refreshLoginStatus() {
+        let status = SMAppService.mainApp.status
+        launchAtLogin = status == .enabled || status == .requiresApproval
+        needsApproval = status == .requiresApproval
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        guard !updatingLogin else { return }
+        updatingLogin = true
+        loginError = nil
+        Task { @MainActor in
+            defer {
+                refreshLoginStatus()
+                updatingLogin = false
+            }
+            do {
+                if enabled {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try await SMAppService.mainApp.unregister()
+                }
+            } catch {
+                loginError = error.localizedDescription
+                DiagnosticLog.event("Login item update failed: \(error)")
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject var engine: AudioEngine
+    @EnvironmentObject var preferences: AppPreferences
     @State private var showCancelAutomaticStart = false
 
     private var isAwaitingAutomaticStart: Bool {
@@ -583,6 +631,41 @@ struct ContentView: View {
             if isAwaitingAutomaticStart && showCancelAutomaticStart {
                 Button("Cancel automatic start") { engine.stop() }
                     .font(.caption)
+            }
+            Divider()
+            DisclosureGroup("Settings", isExpanded: $preferences.settingsExpanded) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Toggle("Launch at login", isOn: Binding(
+                        get: { preferences.launchAtLogin },
+                        set: { preferences.setLaunchAtLogin($0) }))
+                        .disabled(preferences.updatingLogin)
+                    Toggle("Show menu-bar icon", isOn: $preferences.showMenuBarIcon)
+                    Text("Install in Applications before enabling launch at login. Login launches stay in the background.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if preferences.needsApproval {
+                        Button("Approve in Login Items…") {
+                            SMAppService.openSystemSettingsLoginItems()
+                        }
+                    }
+                    if let error = preferences.loginError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.top, 8)
+                .frame(width: 280, alignment: .leading)
+            }
+            HStack {
+                Text("Closing this window keeps audio running.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Quit") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q", modifiers: .command)
             }
         }
         .padding(16)
@@ -642,9 +725,110 @@ final class TerminationCoordinator {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let engine = AudioEngine()
+    let preferences = AppPreferences()
     private let termination = TerminationCoordinator()
+    private var controlWindow: NSWindow?
+    private var statusItem: NSStatusItem?
+    private var subscriptions = Set<AnyCancellable>()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        preferences.menuVisibilityChanged = { [weak self] in self?.updateStatusItem() }
+        engine.objectWillChange.sink { [weak self] _ in
+            // objectWillChange precedes mutation; update from the resulting state.
+            DispatchQueue.main.async { self?.updateStatusMenu() }
+        }.store(in: &subscriptions)
+        updateStatusItem()
+        let event = NSAppleEventManager.shared().currentAppleEvent
+        let loginLaunch = event?.paramDescriptor(forKeyword: keyAEPropData)?
+            .enumCodeValue == keyAELaunchedAsLogInItem
+        DiagnosticLog.event("Application launched loginItem=\(loginLaunch)")
+        if !loginLaunch { showControls() }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showControls()
+        return false
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        preferences.refreshLoginStatus()
+    }
+
+    @objc private func showControls() {
+        if controlWindow == nil {
+            let content = ContentView()
+                .environmentObject(engine)
+                .environmentObject(preferences)
+            let host = NSHostingController(rootView: content)
+            host.sizingOptions = [.minSize, .maxSize, .preferredContentSize]
+            let window = NSWindow(contentViewController: host)
+            window.title = "Keep Mac Audio Alive"
+            window.styleMask = [.titled, .closable, .miniaturizable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            controlWindow = window
+        }
+        preferences.refreshLoginStatus()
+        NSApp.activate(ignoringOtherApps: true)
+        controlWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    private func updateStatusItem() {
+        if preferences.showMenuBarIcon {
+            if statusItem == nil {
+                statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+                statusItem?.button?.image = NSImage(
+                    systemSymbolName: "waveform", accessibilityDescription: "Keep Mac Audio Alive")
+            }
+            updateStatusMenu()
+        } else if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
+    }
+
+    private func updateStatusMenu() {
+        guard let statusItem else { return }
+        let menu = NSMenu()
+        func add(_ title: String, _ action: Selector) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        add("Open KeepMacAudioAlive", #selector(showControls))
+        add(engine.isRunning ? "Stop" : "Start", #selector(toggleAudio))
+        if engine.isEnabled && !engine.isRunning {
+            add("Cancel automatic start", #selector(cancelAutomaticStart))
+        }
+        menu.addItem(.separator())
+        add("Settings…", #selector(showSettings))
+        add("Quit", #selector(quit))
+        statusItem.menu = menu
+        statusItem.button?.toolTip = "Keep Mac Audio Alive — \(engine.status)"
+    }
+
+    @objc private func toggleAudio() {
+        engine.isRunning ? engine.stop() : engine.start()
+    }
+
+    @objc private func cancelAutomaticStart() { engine.stop() }
+
+    @objc fileprivate func showSettings() {
+        preferences.settingsExpanded = true
+        showControls()
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if let statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
         termination.begin(cleanup: { completion in
             engine.shutdown(completion: completion)
         }, reply: { timedOut in
@@ -666,10 +850,17 @@ struct AudioKeepAliveApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        WindowGroup("Keep Mac Audio Alive") {
-            ContentView().environmentObject(delegate.engine)
+        // AppDelegate owns the single reopenable window. Avoid an automatic
+        // SwiftUI WindowGroup opening a window on a background login launch.
+        Settings {
+            EmptyView()
         }
-        .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { delegate.showSettings() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+        }
     }
 }
 #endif
