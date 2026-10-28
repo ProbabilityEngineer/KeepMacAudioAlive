@@ -992,7 +992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.styleMask = [.titled, .closable, .miniaturizable]
             window.isReleasedWhenClosed = false
             window.delegate = self
-            window.center()
+            restorePosition(of: window, name: "KeepMacAudioAlive.Controls")
             controlWindow = window
         }
         preferences.refreshLoginStatus()
@@ -1022,7 +1022,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             menu.addItem(item)
         }
         add("Open KeepMacAudioAlive", #selector(showControls))
-        add(engine.offersStop ? "Stop All" : "Start All", #selector(toggleAudio))
+        if engine.rows.filter({ $0.selectedDeviceUID != nil }).count > 1 {
+            add(engine.offersStop ? "Stop All" : "Start All", #selector(toggleAudio))
+        }
         for row in engine.rows where row.selectedDeviceUID != nil {
             let name = row.devices.first { $0.uid == row.selectedDeviceUID }?.name ?? "Disconnected output"
             let item = NSMenuItem(
@@ -1060,7 +1062,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.delegate = self
-            window.center()
+            restorePosition(of: window, name: "KeepMacAudioAlive.Settings")
             settingsWindow = window
         }
         present(settingsWindow)
@@ -1071,9 +1073,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateStatusItem()
     }
 
+    private func restorePosition(of window: NSWindow, name: NSWindow.FrameAutosaveName) {
+        let contentSizedFrame = window.frame
+        if window.setFrameUsingName(name) {
+            // Retain the saved top-left position, but let current content dictate
+            // size (the number of output rows may have changed since last launch).
+            let topLeft = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+            window.setFrame(NSRect(
+                x: topLeft.x, y: topLeft.y - contentSizedFrame.height,
+                width: contentSizedFrame.width, height: contentSizedFrame.height),
+                display: false)
+        } else {
+            window.center()
+        }
+        window.setFrameAutosaveName(name)
+    }
+
     private func present(_ window: NSWindow?) {
         // Window presentation does not override the user's Dock preference.
         applyIconPreferences()
+        // Recheck on reopening as well: the user may have disconnected a display
+        // while this retained window was closed.
+        if let window, let screen = window.screen ?? NSScreen.main {
+            window.setFrame(window.constrainFrameRect(window.frame, to: screen), display: false)
+        }
         window?.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
