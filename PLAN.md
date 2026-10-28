@@ -250,6 +250,31 @@ Supersedes the expandable-settings and always-hidden-login behaviour above:
   and Debug build pass. Trackball freeze cause and physical recovery timing
   remain unverified until the next user test.
 
+### Confirmed follow-up and multiple-output support
+
+- User confirmed that closing Kontakt restored the expected Start/Stop behaviour
+  and approximately one-second sleep/wake recovery. Bluetooth freezing also
+  occurred intermittently with this app closed; treat it as a separate issue.
+- Removed the Services submenu without changing system-wide service preferences.
+- Added independent output rows with picker, indicator, Start/Stop, and minus
+  button, plus Add output. New rows start unselected and do not silently choose
+  hardware. Removing all rows leaves an Add output empty state.
+- Each row owns its own serial lifecycle queue, stream, callback heartbeat,
+  retry budget, and sleep/wake handling. One stalled control queue does not block
+  another output's control queue.
+- Persist row device UIDs and enabled intent; migrate the legacy single UID.
+  Disabled rows remain disabled across launches; configured enabled rows resume.
+- Prevent duplicate UIDs, including absent devices and selections in flight.
+  Reserve the old UID until teardown succeeds, and the new UID while selection
+  is pending. Invalid duplicate saved entries are normalized on load.
+- Removing a row completes only after listener/stream cleanup. On cleanup failure,
+  retain the row/device reservation with an error rather than allowing duplicates.
+- Quit requests cleanup for every row through the existing five-second deadline.
+- Optional status menu offers Start All/Stop All and per-output controls.
+- Build and existing health/termination/capture tests pass. Added configuration
+  deduplication/serialization checks. Multi-device hardware operation, row
+  selection/removal, and restoration still need user validation.
+
 ## Validation strategy
 
 - Build after each milestone and review diagnostics.

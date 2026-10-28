@@ -3,6 +3,19 @@ import Foundation
 @main
 struct StreamHealthTests {
     static func main() {
+        let configurations = [
+            OutputConfiguration(uid: "anker", enabled: true),
+            OutputConfiguration(uid: "usb-dac", enabled: false),
+            OutputConfiguration(uid: "anker", enabled: false),
+            OutputConfiguration(uid: nil, enabled: true),
+        ]
+        let unique = OutputConfiguration.unique(configurations)
+        precondition(unique.count == 3)
+        precondition(unique[0].enabled && !unique[1].enabled)
+        precondition(unique[2].uid == nil)
+        let encoded = try! JSONEncoder().encode(unique)
+        precondition(try! JSONDecoder().decode([OutputConfiguration].self, from: encoded) == unique)
+        precondition(OutputConfiguration.unique([]).isEmpty)
         var sleep = SleepState()
         sleep.willSleep()
         precondition(sleep.sleeping)

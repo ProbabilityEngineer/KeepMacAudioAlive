@@ -71,21 +71,17 @@ nonisolated private enum DiagnosticLog {
 
 // UI state is main-thread confined. CoreAudio ownership lives on AudioController.queue.
 @MainActor
-final class AudioEngine: ObservableObject {
+final class AudioEngine: ObservableObject, Identifiable {
+    let id = UUID()
     @Published private(set) var isRunning = false
     @Published private(set) var isEnabled = true
     @Published private(set) var devices: [AudioDevice] = []
     @Published private(set) var status = "Connecting"
     @Published private(set) var isShuttingDown = false
     var hasFailure: Bool { status.localizedCaseInsensitiveContains("failed") }
-    var offersStop: Bool { isEnabled && !hasFailure }
-    @Published var selectedDeviceUID: String? {
-        didSet {
-            guard !isShuttingDown else { return }
-            UserDefaults.standard.set(selectedDeviceUID, forKey: "LastSelectedDeviceUID")
-            controller.select(selectedDeviceUID)
-        }
-    }
+    var offersStop: Bool { selectedDeviceUID != nil && isEnabled && !hasFailure }
+    @Published private(set) var selectedDeviceUID: String?
+    @Published private(set) var isSelecting = false
 
     nonisolated struct AudioDevice: Hashable, Identifiable, Sendable {
         let id: AudioDeviceID
@@ -96,9 +92,10 @@ final class AudioEngine: ObservableObject {
     private let controller = AudioController()
     private var observers: [NSObjectProtocol] = []
 
-    init() {
+    init(uid: String?, enabled: Bool) {
         DiagnosticLog.event("Application engine initialized")
-        selectedDeviceUID = UserDefaults.standard.string(forKey: "LastSelectedDeviceUID")
+        selectedDeviceUID = uid
+        isEnabled = enabled
         controller.report = { [weak self] devices, running, status in
             DispatchQueue.main.async {
                 guard let self, !self.isShuttingDown else { return }
@@ -106,9 +103,6 @@ final class AudioEngine: ObservableObject {
                 self.isRunning = running
                 self.status = status
                 DiagnosticLog.event("UI applied status=\(status) running=\(running)")
-                if self.selectedDeviceUID == nil, let first = devices.first {
-                    self.selectedDeviceUID = first.uid
-                }
             }
         }
         let center = NSWorkspace.shared.notificationCenter
@@ -124,7 +118,7 @@ final class AudioEngine: ObservableObject {
             DiagnosticLog.event("NOTIFICATION didWake received on main thread")
             self?.controller.setSleeping(false)
         })
-        controller.begin(uid: selectedDeviceUID)
+        controller.begin(uid: selectedDeviceUID, enabled: enabled)
     }
 
     deinit {
@@ -148,7 +142,7 @@ final class AudioEngine: ObservableObject {
         controller.setEnabled(false)
     }
 
-    func shutdown(completion: @escaping @Sendable () -> Void) {
+    func shutdown(completion: @escaping @Sendable (Bool) -> Void) {
         isShuttingDown = true
         isEnabled = false
         isRunning = false
@@ -159,6 +153,146 @@ final class AudioEngine: ObservableObject {
         observers.removeAll()
         DiagnosticLog.event("Workspace observers removed; shutdown requested")
         controller.shutdown(completion: completion)
+    }
+
+    func removalFailed() {
+        status = "Removal failed. Quit the app before reusing this device."
+    }
+
+    func select(_ uid: String?, completion: @escaping () -> Void) {
+        guard !isShuttingDown, !isSelecting else { completion(); return }
+        isSelecting = true
+        controller.select(uid) { [weak self] accepted in
+            DispatchQueue.main.async {
+                guard let self else { completion(); return }
+                if accepted { self.selectedDeviceUID = uid }
+                self.isSelecting = false
+                completion()
+            }
+        }
+    }
+}
+
+nonisolated struct OutputConfiguration: Codable, Equatable {
+    var uid: String?
+    var enabled: Bool
+
+    static func unique(_ configurations: [Self]) -> [Self] {
+        var seen = Set<String>()
+        return configurations.filter { config in
+            guard let uid = config.uid else { return true }
+            return seen.insert(uid).inserted
+        }
+    }
+}
+
+@MainActor
+final class AudioOutputs: ObservableObject {
+    @Published private(set) var rows: [AudioEngine] = []
+    @Published private(set) var isShuttingDown = false
+    private var subscriptions: [UUID: AnyCancellable] = [:]
+    private var pendingSelections: [UUID: String] = [:]
+
+    init() {
+        let defaults = UserDefaults.standard
+        let saved = defaults.data(forKey: "AudioOutputs")
+            .flatMap { try? JSONDecoder().decode([OutputConfiguration].self, from: $0) }
+        let configurations = saved ?? [
+            OutputConfiguration(uid: defaults.string(forKey: "LastSelectedDeviceUID"), enabled: true)
+        ]
+        for config in OutputConfiguration.unique(configurations) {
+            append(uid: config.uid, enabled: config.enabled)
+        }
+        if rows.isEmpty { append(uid: nil, enabled: true) }
+    }
+
+    var offersStop: Bool { rows.contains { $0.offersStop && !$0.isShuttingDown } }
+    var status: String {
+        "\(rows.filter { $0.isRunning }.count) of \(rows.count) outputs active"
+    }
+
+    private func append(uid: String?, enabled: Bool) {
+        let row = AudioEngine(uid: uid, enabled: enabled)
+        rows.append(row)
+        subscriptions[row.id] = row.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.objectWillChange.send()
+                if !self.isShuttingDown { self.save() }
+            }
+        }
+    }
+
+    private func save() {
+        let configs = rows.map { OutputConfiguration(uid: $0.selectedDeviceUID, enabled: $0.isEnabled) }
+        if let data = try? JSONEncoder().encode(configs) {
+            if UserDefaults.standard.data(forKey: "AudioOutputs") != data {
+                UserDefaults.standard.set(data, forKey: "AudioOutputs")
+            }
+        }
+    }
+
+    func add() {
+        guard !isShuttingDown else { return }
+        append(uid: nil, enabled: true)
+        save()
+    }
+
+    func isAvailable(_ uid: String, for row: AudioEngine) -> Bool {
+        !rows.contains { $0.id != row.id && $0.selectedDeviceUID == uid } &&
+        !pendingSelections.contains { $0.key != row.id && $0.value == uid }
+    }
+
+    func select(_ uid: String?, for row: AudioEngine) {
+        guard !isShuttingDown, !row.isShuttingDown, !row.isSelecting,
+              uid.map({ isAvailable($0, for: row) }) ?? true else { return }
+        // Reserve the new UID while the row still owns its old UID. Release the
+        // old selection only after its IOProc has been successfully destroyed.
+        pendingSelections[row.id] = uid
+        objectWillChange.send()
+        row.select(uid) { [weak self] in
+            guard let self else { return }
+            self.pendingSelections.removeValue(forKey: row.id)
+            self.objectWillChange.send()
+            if !self.isShuttingDown { self.save() }
+        }
+    }
+
+    func remove(_ row: AudioEngine) {
+        guard !isShuttingDown, !row.isShuttingDown,
+              rows.filter({ !$0.isShuttingDown }).count > 1 else { return }
+        row.shutdown { [weak self, weak row] cleaned in
+            DispatchQueue.main.async {
+                guard let self, let row, !self.isShuttingDown else { return }
+                if cleaned {
+                    self.rows.removeAll { $0.id == row.id }
+                    self.subscriptions.removeValue(forKey: row.id)
+                    self.save()
+                } else {
+                    row.removalFailed()
+                }
+            }
+        }
+    }
+
+    func start() {
+        for row in rows where row.selectedDeviceUID != nil && !row.isShuttingDown { row.start() }
+    }
+
+    func stop() {
+        for row in rows where !row.isShuttingDown { row.stop() }
+    }
+
+    func shutdown(completion: @escaping @Sendable () -> Void) {
+        // Save user intent before shutdown clears each engine's enabled flag.
+        save()
+        isShuttingDown = true
+        let group = DispatchGroup()
+        for row in rows {
+            group.enter()
+            row.shutdown { _ in group.leave() }
+        }
+        group.notify(queue: .main, execute: completion)
     }
 }
 
@@ -234,13 +368,14 @@ nonisolated struct SleepState {
 // touches it. Nonisolated opts out of this project's default MainActor isolation.
 nonisolated private final class AudioController: @unchecked Sendable {
     var report: (([AudioEngine.AudioDevice], Bool, String) -> Void)?
-    private let queue = DispatchQueue(label: "KeepMacAudioAlive.lifecycle")
+    private let queue = DispatchQueue(label: "KeepMacAudioAlive.lifecycle.\(UUID().uuidString)")
     private var listener: AudioObjectPropertyListenerBlock?
     private var uid: String?
     private var enabled = true
     private var sleepState = SleepState()
     private var sleeping: Bool { sleepState.sleeping }
     private var closed = false
+    private var shutdownSucceeded = false
     private var devices: [AudioEngine.AudioDevice] = []
     private var stream: (device: AudioDeviceID, uid: String, proc: AudioDeviceIOProcID,
                          heartbeat: UnsafeMutableRawPointer)?
@@ -258,9 +393,10 @@ nonisolated private final class AudioController: @unchecked Sendable {
             mElement: kAudioObjectPropertyElementMain)
     }
 
-    func begin(uid: String?) {
+    func begin(uid: String?, enabled: Bool) {
         queue.async { [self] in
             self.uid = uid
+            self.enabled = enabled
             let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 guard let self, !self.closed else { return }
                 DiagnosticLog.event("Device-list notification executing on lifecycle queue")
@@ -279,11 +415,16 @@ nonisolated private final class AudioController: @unchecked Sendable {
         }
     }
 
-    func select(_ uid: String?) {
+    func select(_ uid: String?, completion: @escaping @Sendable (Bool) -> Void) {
         queue.async {
-            guard !self.closed else { return }
+            guard !self.closed else { completion(false); return }
+            if self.uid != uid {
+                self.publish("Changing output", running: false)
+                guard self.tearDown() else { completion(false); return }
+            }
             self.uid = uid
             self.invalidateRetries()
+            completion(true)
             self.reconcile()
         }
     }
@@ -322,10 +463,10 @@ nonisolated private final class AudioController: @unchecked Sendable {
         }
     }
 
-    func shutdown(completion: @escaping @Sendable () -> Void = {}) {
+    func shutdown(completion: @escaping @Sendable (Bool) -> Void = { _ in }) {
         queue.async {
             guard !self.closed else {
-                completion()
+                completion(self.shutdownSucceeded)
                 return
             }
             DiagnosticLog.event("Shutdown executing on lifecycle queue")
@@ -342,9 +483,10 @@ nonisolated private final class AudioController: @unchecked Sendable {
                 self.listener = nil
             }
             let cleaned = self.tearDown()
+            self.shutdownSucceeded = cleaned
             self.report = nil
             DiagnosticLog.event("Shutdown cleanup finished resourcesReleased=\(cleaned)")
-            DiagnosticLog.flush(completion: completion)
+            DiagnosticLog.flush { completion(cleaned) }
         }
     }
 
@@ -362,10 +504,10 @@ nonisolated private final class AudioController: @unchecked Sendable {
         if teardownRequired {
             guard tearDown() else { return }
         }
-        if sleeping || !enabled {
-            publish(sleeping ? "Sleeping" : "Stopping", running: false)
+        if sleeping {
+            publish("Sleeping", running: false)
             if tearDown() {
-                publish(sleeping ? "Sleeping" : "Disabled", running: false)
+                publish("Sleeping", running: false)
             }
             return
         }
@@ -381,6 +523,11 @@ nonisolated private final class AudioController: @unchecked Sendable {
             return
         }
         let target = devices.first { $0.uid == uid }
+        if !enabled {
+            publish("Stopping", running: false)
+            if tearDown() { publish("Disabled", running: false) }
+            return
+        }
         if let stream, stream.device != target?.id || stream.uid != target?.uid {
             guard tearDown() else { return }
         }
@@ -500,7 +647,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
     }
 
     private func publish(_ status: String, running: Bool) {
-        DiagnosticLog.event("STATE \(status) running=\(running) generation=\(generation)")
+        DiagnosticLog.event("STATE \(status) running=\(running) generation=\(generation) outputUID=\(uid ?? "unselected")")
         report?(devices, running, status)
     }
 
@@ -628,9 +775,9 @@ final class AppPreferences: ObservableObject {
     }
 }
 
-struct ContentView: View {
-    @EnvironmentObject var engine: AudioEngine
-    @EnvironmentObject var preferences: AppPreferences
+struct OutputRowView: View {
+    @ObservedObject var engine: AudioEngine
+    @ObservedObject var outputs: AudioOutputs
 
     private var isAwaitingAutomaticStart: Bool {
         engine.offersStop && !engine.isRunning && !engine.isShuttingDown
@@ -654,20 +801,42 @@ struct ContentView: View {
                     Text(engine.offersStop ? "Stop" : "Start")
                         .frame(width: 50)
                 }
-                Picker("Device", selection: $engine.selectedDeviceUID) {
+                .disabled(engine.selectedDeviceUID == nil || engine.isSelecting)
+                Picker("Device", selection: Binding(
+                    get: { engine.selectedDeviceUID },
+                    set: { outputs.select($0, for: engine) })) {
                     if let uid = engine.selectedDeviceUID,
                        !engine.devices.contains(where: { $0.uid == uid }) {
                         Text("Selected device disconnected").tag(Optional(uid))
                     } else if engine.selectedDeviceUID == nil {
-                        Text("No device selected").tag(String?.none)
+                        Text("Select an output…").tag(String?.none)
                     }
-                    ForEach(engine.devices) { device in
+                    ForEach(engine.devices.filter {
+                        outputs.isAvailable($0.uid, for: engine)
+                    }) { device in
                         Text(device.name).tag(Optional(device.uid))
                     }
                 }
                 .labelsHidden()
                 .frame(width: 200)
-                .disabled(engine.isRunning)
+                .disabled(engine.isRunning || engine.isSelecting)
+                Button {
+                    outputs.add()
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 16, height: 16)
+                }
+                .help("Add output")
+                .accessibilityLabel("Add output")
+                Button {
+                    outputs.remove(engine)
+                } label: {
+                    Image(systemName: "minus")
+                        .frame(width: 16, height: 16)
+                }
+                .disabled(outputs.rows.filter { !$0.isShuttingDown }.count <= 1)
+                .help("Remove output")
+                .accessibilityLabel("Remove output")
             }
             if engine.hasFailure {
                 Text(engine.status)
@@ -675,9 +844,32 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
         }
-        .padding(16)
         .fixedSize()
         .disabled(engine.isShuttingDown)
+    }
+}
+
+struct ContentView: View {
+    @EnvironmentObject var outputs: AudioOutputs
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(outputs.rows) { row in
+                OutputRowView(engine: row, outputs: outputs)
+            }
+            if outputs.rows.isEmpty {
+                Button {
+                    outputs.add()
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .help("Add output")
+                .accessibilityLabel("Add output")
+            }
+        }
+        .padding(16)
+        .fixedSize()
+        .disabled(outputs.isShuttingDown)
     }
 }
 
@@ -753,7 +945,7 @@ final class TerminationCoordinator {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    let engine = AudioEngine()
+    let engine = AudioOutputs()
     let preferences = AppPreferences()
     private let termination = TerminationCoordinator()
     private var controlWindow: NSWindow?
@@ -793,7 +985,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if controlWindow == nil {
             let content = ContentView()
                 .environmentObject(engine)
-                .environmentObject(preferences)
             let host = NSHostingController(rootView: content)
             host.sizingOptions = [.minSize, .maxSize, .preferredContentSize]
             let window = NSWindow(contentViewController: host)
@@ -831,7 +1022,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             menu.addItem(item)
         }
         add("Open KeepMacAudioAlive", #selector(showControls))
-        add(engine.offersStop ? "Stop" : "Start", #selector(toggleAudio))
+        add(engine.offersStop ? "Stop All" : "Start All", #selector(toggleAudio))
+        for row in engine.rows where row.selectedDeviceUID != nil {
+            let name = row.devices.first { $0.uid == row.selectedDeviceUID }?.name ?? "Disconnected output"
+            let item = NSMenuItem(
+                title: "\(row.offersStop ? "Stop" : "Start") \(name)",
+                action: #selector(toggleOutput(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = row
+            item.isEnabled = !row.isShuttingDown && !row.isSelecting
+            menu.addItem(item)
+        }
         menu.addItem(.separator())
         add("Settings…", #selector(showSettings))
         add("Quit KeepMacAudioAlive", #selector(quit))
@@ -841,6 +1042,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func toggleAudio() {
         engine.offersStop ? engine.stop() : engine.start()
+    }
+
+    @objc private func toggleOutput(_ sender: NSMenuItem) {
+        guard let row = sender.representedObject as? AudioEngine,
+              !row.isShuttingDown, !row.isSelecting else { return }
+        row.offersStop ? row.stop() : row.start()
     }
 
     @objc fileprivate func showSettings() {
@@ -891,11 +1098,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         app.addItem(.separator())
         add("Settings…", #selector(showSettings), ",", target: self)
         add("Open KeepMacAudioAlive", #selector(showControls), target: self)
-        app.addItem(.separator())
-        let services = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
-        services.submenu = NSMenu(title: "Services")
-        app.addItem(services)
-        NSApp.servicesMenu = services.submenu
         app.addItem(.separator())
         add("Hide KeepMacAudioAlive", #selector(NSApplication.hide(_:)), "h", target: NSApp)
         add("Show All", #selector(NSApplication.unhideAllApplications(_:)), target: NSApp)
