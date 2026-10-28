@@ -181,6 +181,52 @@ Implemented for preview; manual UI/login validation pending:
 - Validate expansion/window resizing, icon toggling, close/reopen, Quit, and
   actual login startup on the installed build before marking acceptance complete.
 
+### Revised presentation: separate Settings window
+
+Supersedes the expandable-settings and always-hidden-login behaviour above:
+
+- Separate Settings window, available through the standard application menu
+  (Settings…, Command-comma) and optional status-item menu.
+- Explicit application menu provides About, Settings, Open, Services, Hide,
+  Show All, and Quit.
+- “Show icon in:” offers Dock and menu bar, Dock only, Menu bar only, Neither.
+  Switching Dock visibility changes activation policy; the prior menu-icon
+  preference migrates when no new selection is stored.
+- “Show window on launch” is an independent persisted checkbox, default on.
+  It governs a new process launch, including login launch. Reopening an already
+  running process always presents the controls.
+- Launch at login remains a separate setting.
+- Status-menu Quit is labelled “Quit KeepMacAudioAlive”.
+- Multiple-output support remains a later change; audio behaviour is unchanged.
+- Build and existing health/termination tests pass. Actual menu behaviour under
+  both activation policies, settings resizing, login, and reopen still require
+  manual validation.
+
+### Menu and startup presentation correction
+
+- Removed separate Cancel automatic start and routine status labels. Enabled
+  startup/recovery shows a spinner and Stop; active callbacks show green and
+  Stop; disabled or failed output offers Start. Device selection remains
+  available whenever a stream is not running.
+- Persistent failures retain concise visible errors; detailed states stay in logs.
+- AppKit now owns application startup, menus, and windows; SwiftUI is hosted
+  content only, eliminating competing scene-menu installation.
+- Accessory activation policy does not provide a standard application menu.
+  Opening controls/settings temporarily uses regular activation, including a
+  Dock icon. After the last window closes, the selected background icon policy
+  is restored. Settings explicitly describes this trade-off.
+- Existing tests/build pass; on-device menu display and icon transitions still
+  require visual validation. No app process was stopped or launched in this pass.
+
+### User-selected icon policy (supersedes temporary Dock behaviour above)
+
+- Window presentation no longer changes activation policy. Dock-selected modes
+  use regular activation and the application menu; other modes stay accessory.
+- Removed the installation guidance and temporary-Dock explanation from Settings.
+- Removed the main-window Quit button and closing-window explanation.
+- Settings/Quit remain in the application menu (Dock modes) and optional status
+  menu. With Neither selected, neither menu is visibly available.
+
 ## Validation strategy
 
 - Build after each milestone and review diagnostics.

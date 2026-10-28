@@ -77,6 +77,8 @@ final class AudioEngine: ObservableObject {
     @Published private(set) var devices: [AudioDevice] = []
     @Published private(set) var status = "Connecting"
     @Published private(set) var isShuttingDown = false
+    var hasFailure: Bool { status.localizedCaseInsensitiveContains("failed") }
+    var offersStop: Bool { isEnabled && !hasFailure }
     @Published var selectedDeviceUID: String? {
         didSet {
             guard !isShuttingDown else { return }
@@ -432,7 +434,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
         // A removed device no longer owns a usable IOProc. For other failures,
         // retain ownership and refuse to create a potentially duplicate stream.
         guard destroyed == noErr || destroyed == kAudioHardwareBadDeviceError else {
-            publish("Stream cleanup failed; retry Stop/Start", running: false)
+            publish("Stream cleanup failed. Click Start to retry.", running: false)
             return false
         }
         self.stream = nil
@@ -447,7 +449,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard enabled, !sleeping, !closed, retry == nil else { return }
         guard let delay = recoveryBudget.nextDelay() else {
-            publish("Recovery failed; retry Stop/Start", running: false)
+            publish("Recovery failed. Click Start to retry.", running: false)
             return
         }
         let token = generation
@@ -532,12 +534,27 @@ nonisolated private final class AudioController: @unchecked Sendable {
 
 @MainActor
 final class AppPreferences: ObservableObject {
-    @Published var settingsExpanded = false
-    @Published var showMenuBarIcon = UserDefaults.standard.bool(forKey: "ShowMenuBarIcon") {
+    enum IconLocation: String, CaseIterable, Identifiable {
+        case both = "Dock and menu bar"
+        case dock = "Dock only"
+        case menuBar = "Menu bar only"
+        case neither = "Neither"
+        var id: String { rawValue }
+        var showsDock: Bool { self == .both || self == .dock }
+        var showsMenuBar: Bool { self == .both || self == .menuBar }
+    }
+    @Published var iconLocation: IconLocation = {
+        if let saved = UserDefaults.standard.string(forKey: "IconLocation"),
+           let location = IconLocation(rawValue: saved) { return location }
+        return UserDefaults.standard.bool(forKey: "ShowMenuBarIcon") ? .menuBar : .neither
+    }() {
         didSet {
-            UserDefaults.standard.set(showMenuBarIcon, forKey: "ShowMenuBarIcon")
+            UserDefaults.standard.set(iconLocation.rawValue, forKey: "IconLocation")
             menuVisibilityChanged?()
         }
+    }
+    @Published var showWindowOnLaunch = UserDefaults.standard.object(forKey: "ShowWindowOnLaunch") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showWindowOnLaunch, forKey: "ShowWindowOnLaunch") }
     }
     @Published private(set) var launchAtLogin = false
     @Published private(set) var needsApproval = false
@@ -579,20 +596,16 @@ final class AppPreferences: ObservableObject {
 struct ContentView: View {
     @EnvironmentObject var engine: AudioEngine
     @EnvironmentObject var preferences: AppPreferences
-    @State private var showCancelAutomaticStart = false
 
     private var isAwaitingAutomaticStart: Bool {
-        engine.isEnabled && !engine.isRunning && !engine.isShuttingDown
+        engine.offersStop && !engine.isRunning && !engine.isShuttingDown
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Group {
-                    if isAwaitingAutomaticStart &&
-                        (engine.status == "Connecting" ||
-                         engine.status == "Waking" ||
-                         engine.status == "Waiting for audio callbacks") {
+                    if isAwaitingAutomaticStart {
                         ProgressView()
                             .controlSize(.small)
                     } else {
@@ -602,8 +615,8 @@ struct ContentView: View {
                     }
                 }
                 .frame(width: 24, height: 24)
-                Button(action: { engine.isRunning ? engine.stop() : engine.start() }) {
-                    Text(engine.isRunning ? "Stop" : "Start")
+                Button(action: { engine.offersStop ? engine.stop() : engine.start() }) {
+                    Text(engine.offersStop ? "Stop" : "Start")
                         .frame(width: 50)
                 }
                 Picker("Device", selection: $engine.selectedDeviceUID) {
@@ -621,67 +634,48 @@ struct ContentView: View {
                 .frame(width: 200)
                 .disabled(engine.isRunning)
             }
-            if engine.status != "Started" && engine.status != "Disabled" &&
-                engine.status != "Waiting for audio callbacks" &&
-                engine.status != "Connecting" && engine.status != "Waking" {
+            if engine.hasFailure {
                 Text(engine.status)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if isAwaitingAutomaticStart && showCancelAutomaticStart {
-                Button("Cancel automatic start") { engine.stop() }
-                    .font(.caption)
-            }
-            Divider()
-            DisclosureGroup("Settings", isExpanded: $preferences.settingsExpanded) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Toggle("Launch at login", isOn: Binding(
-                        get: { preferences.launchAtLogin },
-                        set: { preferences.setLaunchAtLogin($0) }))
-                        .disabled(preferences.updatingLogin)
-                    Toggle("Show menu-bar icon", isOn: $preferences.showMenuBarIcon)
-                    Text("Install in Applications before enabling launch at login. Login launches stay in the background.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if preferences.needsApproval {
-                        Button("Approve in Login Items…") {
-                            SMAppService.openSystemSettingsLoginItems()
-                        }
-                    }
-                    if let error = preferences.loginError {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(.top, 8)
-                .frame(width: 280, alignment: .leading)
-            }
-            HStack {
-                Text("Closing this window keeps audio running.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
-                    .keyboardShortcut("q", modifiers: .command)
+                    .foregroundStyle(.red)
             }
         }
         .padding(16)
         .fixedSize()
         .disabled(engine.isShuttingDown)
-        .task(id: isAwaitingAutomaticStart) {
-            showCancelAutomaticStart = false
-            guard isAwaitingAutomaticStart else { return }
-            do {
-                try await Task.sleep(for: .seconds(2))
-            } catch {
-                return
+    }
+}
+
+struct PreferencesView: View {
+    @ObservedObject var preferences: AppPreferences
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Toggle("Launch at login", isOn: Binding(
+                get: { preferences.launchAtLogin },
+                set: { preferences.setLaunchAtLogin($0) }))
+                .disabled(preferences.updatingLogin)
+            Toggle("Show window on launch", isOn: $preferences.showWindowOnLaunch)
+            Picker("Show icon in:", selection: $preferences.iconLocation) {
+                ForEach(AppPreferences.IconLocation.allCases) { location in
+                    Text(location.rawValue).tag(location)
+                }
             }
-            guard !Task.isCancelled else { return }
-            showCancelAutomaticStart = true
+            if preferences.iconLocation == .neither {
+                Text("Open KeepMacAudioAlive from Finder or Spotlight to access its controls when it is running.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if preferences.needsApproval {
+                Button("Approve in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+            }
+            if let error = preferences.loginError {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
         }
+        .padding(20)
+        .frame(width: 360)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -723,26 +717,28 @@ final class TerminationCoordinator {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let engine = AudioEngine()
     let preferences = AppPreferences()
     private let termination = TerminationCoordinator()
     private var controlWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var statusItem: NSStatusItem?
     private var subscriptions = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        preferences.menuVisibilityChanged = { [weak self] in self?.updateStatusItem() }
+        preferences.menuVisibilityChanged = { [weak self] in self?.applyIconPreferences() }
         engine.objectWillChange.sink { [weak self] _ in
             // objectWillChange precedes mutation; update from the resulting state.
             DispatchQueue.main.async { self?.updateStatusMenu() }
         }.store(in: &subscriptions)
-        updateStatusItem()
+        installApplicationMenu()
+        applyIconPreferences()
         let event = NSAppleEventManager.shared().currentAppleEvent
         let loginLaunch = event?.paramDescriptor(forKeyword: keyAEPropData)?
             .enumCodeValue == keyAELaunchedAsLogInItem
         DiagnosticLog.event("Application launched loginItem=\(loginLaunch)")
-        if !loginLaunch { showControls() }
+        if preferences.showWindowOnLaunch { showControls() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -769,16 +765,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.title = "Keep Mac Audio Alive"
             window.styleMask = [.titled, .closable, .miniaturizable]
             window.isReleasedWhenClosed = false
+            window.delegate = self
             window.center()
             controlWindow = window
         }
         preferences.refreshLoginStatus()
-        NSApp.activate(ignoringOtherApps: true)
-        controlWindow?.makeKeyAndOrderFront(nil)
+        present(controlWindow)
     }
 
     private func updateStatusItem() {
-        if preferences.showMenuBarIcon {
+        if preferences.iconLocation.showsMenuBar {
             if statusItem == nil {
                 statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
                 statusItem?.button?.image = NSImage(
@@ -800,26 +796,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         add("Open KeepMacAudioAlive", #selector(showControls))
-        add(engine.isRunning ? "Stop" : "Start", #selector(toggleAudio))
-        if engine.isEnabled && !engine.isRunning {
-            add("Cancel automatic start", #selector(cancelAutomaticStart))
-        }
+        add(engine.offersStop ? "Stop" : "Start", #selector(toggleAudio))
         menu.addItem(.separator())
         add("Settings…", #selector(showSettings))
-        add("Quit", #selector(quit))
+        add("Quit KeepMacAudioAlive", #selector(quit))
         statusItem.menu = menu
         statusItem.button?.toolTip = "Keep Mac Audio Alive — \(engine.status)"
     }
 
     @objc private func toggleAudio() {
-        engine.isRunning ? engine.stop() : engine.start()
+        engine.offersStop ? engine.stop() : engine.start()
     }
 
-    @objc private func cancelAutomaticStart() { engine.stop() }
-
     @objc fileprivate func showSettings() {
-        preferences.settingsExpanded = true
-        showControls()
+        preferences.refreshLoginStatus()
+        if settingsWindow == nil {
+            let host = NSHostingController(rootView: PreferencesView(preferences: preferences))
+            host.sizingOptions = [.minSize, .maxSize, .preferredContentSize]
+            let window = NSWindow(contentViewController: host)
+            window.title = "KeepMacAudioAlive Settings"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            settingsWindow = window
+        }
+        present(settingsWindow)
+    }
+
+    private func applyIconPreferences() {
+        NSApp.setActivationPolicy(preferences.iconLocation.showsDock ? .regular : .accessory)
+        updateStatusItem()
+    }
+
+    private func present(_ window: NSWindow?) {
+        // Window presentation does not override the user's Dock preference.
+        applyIconPreferences()
+        window?.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            window?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.applyIconPreferences() }
+    }
+
+    private func installApplicationMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem(title: "KeepMacAudioAlive", action: nil, keyEquivalent: "")
+        let app = NSMenu(title: "KeepMacAudioAlive")
+        func add(_ title: String, _ action: Selector, _ key: String = "", target: AnyObject? = nil) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.target = target
+            app.addItem(item)
+        }
+        add("About KeepMacAudioAlive", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), target: NSApp)
+        app.addItem(.separator())
+        add("Settings…", #selector(showSettings), ",", target: self)
+        add("Open KeepMacAudioAlive", #selector(showControls), target: self)
+        app.addItem(.separator())
+        let services = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        services.submenu = NSMenu(title: "Services")
+        app.addItem(services)
+        NSApp.servicesMenu = services.submenu
+        app.addItem(.separator())
+        add("Hide KeepMacAudioAlive", #selector(NSApplication.hide(_:)), "h", target: NSApp)
+        add("Show All", #selector(NSApplication.unhideAllApplications(_:)), target: NSApp)
+        app.addItem(.separator())
+        add("Quit KeepMacAudioAlive", #selector(quit), "q", target: self)
+        appItem.submenu = app
+        main.addItem(appItem)
+        NSApp.mainMenu = main
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
@@ -846,20 +895,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 #if !LIFECYCLE_TESTS
 @main
-struct AudioKeepAliveApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-
-    var body: some Scene {
-        // AppDelegate owns the single reopenable window. Avoid an automatic
-        // SwiftUI WindowGroup opening a window on a background login launch.
-        Settings {
-            EmptyView()
-        }
-        .commands {
-            CommandGroup(replacing: .appSettings) {
-                Button("Settings…") { delegate.showSettings() }
-                    .keyboardShortcut(",", modifiers: .command)
-            }
+enum AudioKeepAliveApp {
+    @MainActor
+    static func main() {
+        // AppKit owns menus and windows; SwiftUI is only the hosted content.
+        // This avoids competing SwiftUI scene-menu installation.
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) {
+            application.run()
         }
     }
 }
