@@ -2,11 +2,14 @@ import SwiftUI
 import CoreAudio
 import AppKit
 import ServiceManagement
+import OSLog
 internal import Combine
 
 // Never called from the audio render callback. Disk writes have their own queue,
 // independent of both the main thread and potentially blocked CoreAudio calls.
 nonisolated private enum DiagnosticLog {
+    private static let logger = Logger(subsystem: "com.github.openmac.KeepAudioAlive", category: "Audio")
+#if DEBUG
     private static let writer = DispatchQueue(label: "KeepMacAudioAlive.diagnostics")
     private static let session = UUID().uuidString
     private static let directory = FileManager.default.homeDirectoryForCurrentUser
@@ -14,14 +17,21 @@ nonisolated private enum DiagnosticLog {
     private static let file = directory.appendingPathComponent("lifecycle.log")
     private static let previous = directory.appendingPathComponent("lifecycle.previous.log")
     private static let limit = 2 * 1024 * 1024
+#endif
 
     static func flush(completion: @escaping @Sendable () -> Void) {
+#if DEBUG
         writer.async { completion() }
+#else
+        completion()
+#endif
     }
 
-    static func event(_ message: String) {
+    static func event(_ message: @autoclosure () -> String) {
+#if DEBUG
         // Capture the event time here, not when the asynchronous write executes.
         let date = Date()
+        let message = message()
         writer.async {
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -51,9 +61,17 @@ nonisolated private enum DiagnosticLog {
                 NSLog("KeepMacAudioAlive diagnostic write failed: %@; %@", "\(error)", line)
             }
         }
+#endif
     }
 
-    static func measure<T>(_ operation: String, _ body: () throws -> T) rethrows -> T {
+    static func error(_ message: String) {
+        logger.error("\(message, privacy: .public)")
+        event("ERROR \(message)")
+    }
+
+    static func measure<T>(_ operation: @autoclosure () -> String, _ body: () throws -> T) rethrows -> T {
+#if DEBUG
+        let operation = operation()
         let id = UUID().uuidString
         let start = ContinuousClock.now
         event("BEGIN id=\(id) \(operation)")
@@ -66,6 +84,9 @@ nonisolated private enum DiagnosticLog {
             event("END id=\(id) \(operation) elapsed=\(start.duration(to: .now)) error=\(error)")
             throw error
         }
+#else
+        return try body()
+#endif
     }
 }
 
@@ -442,11 +463,15 @@ nonisolated private final class AudioController: @unchecked Sendable {
     }
 
     func setSleeping(_ sleeping: Bool) {
+#if DEBUG
         let received = ContinuousClock.now
+#endif
         DiagnosticLog.event("ENQUEUE sleeping=\(sleeping)")
         queue.async {
+#if DEBUG
             DiagnosticLog.event("HANDLE sleeping=\(sleeping) queueWait=\(received.duration(to: .now))")
             defer { DiagnosticLog.event("HANDLED sleeping=\(sleeping) total=\(received.duration(to: .now))") }
+#endif
             guard !self.closed else { return }
             if sleeping {
                 self.sleepState.willSleep()
@@ -541,7 +566,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
         }
         publish("Connecting", running: false)
         guard let heartbeat = KMAHeartbeatCreate() else {
-            DiagnosticLog.event("ERROR heartbeat allocation failed")
+            DiagnosticLog.error("Heartbeat allocation failed")
             scheduleRetry()
             return
         }
@@ -631,6 +656,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         guard enabled, !sleeping, !closed, retry == nil else { return }
         guard let delay = recoveryBudget.nextDelay() else {
+            DiagnosticLog.error("Recovery retry budget exhausted")
             publish("Recovery failed. Click Start to retry.", running: false)
             return
         }
@@ -653,7 +679,7 @@ nonisolated private final class AudioController: @unchecked Sendable {
 
     private func log(_ operation: String, _ status: OSStatus) {
         if status != noErr {
-            DiagnosticLog.event("ERROR \(operation): OSStatus \(status)")
+            DiagnosticLog.error("\(operation): OSStatus \(status)")
         }
     }
 
@@ -769,7 +795,7 @@ final class AppPreferences: ObservableObject {
                 }
             } catch {
                 loginError = error.localizedDescription
-                DiagnosticLog.event("Login item update failed: \(error)")
+                DiagnosticLog.error("Login item update failed: \(error)")
             }
         }
     }
@@ -1144,8 +1170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if timedOut {
                 // Do not call CoreAudio concurrently to interrupt a stuck call.
                 // Process exit is the fallback; it is not graceful cleanup.
-                DiagnosticLog.event("QUIT deadline exceeded; exiting without confirmed cleanup")
-                NSLog("KeepMacAudioAlive: cleanup exceeded five seconds; allowing process exit")
+                DiagnosticLog.error("Quit cleanup exceeded five seconds; allowing process exit without confirmed cleanup")
             }
             sender.reply(toApplicationShouldTerminate: true)
         })

@@ -275,6 +275,19 @@ Supersedes the expandable-settings and always-hidden-login behaviour above:
   deduplication/serialization checks. Multi-device hardware operation, row
   selection/removal, and restoration still need user validation.
 
+### Debug versus Release diagnostics
+
+- Verbose rotating file logs, per-operation UUIDs/timings, and queue-wait
+  measurements are compiled only with DEBUG.
+- Autoclosures avoid evaluating routine log-message and operation-name
+  interpolation in Release. Measurement wrappers still execute audio operations.
+- Release keeps OSLog errors for CoreAudio failures, exhausted recovery, login
+  registration errors, and termination deadlines.
+- Heartbeats, retry/recovery, cleanup, atomic checks, and queue preconditions
+  remain enabled in both configurations.
+- Debug and Release builds pass, as do health/configuration, termination, and
+  Python capture-watcher tests. Capture instructions now specify a Debug build.
+
 ## Validation strategy
 
 - Build after each milestone and review diagnostics.

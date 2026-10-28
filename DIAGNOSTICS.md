@@ -1,7 +1,19 @@
 # Sleep/wake diagnostics
 
-The app records lifecycle events continuously.
+Debug builds record lifecycle events continuously. Release builds do not create
+or append `lifecycle.log`; they retain concise error reporting through Apple's
+unified logging (`com.github.openmac.KeepAudioAlive`, category `Audio`).
+The capture script's Started-event detection requires a Debug build. Against a
+Release build it will collect samples until its timeout; old log files may still
+exist but do not indicate that the Release build is writing them.
 It does not sample automatically, prevent sleep, or change Bluetooth settings.
+
+Release errors can be viewed with:
+
+```sh
+log show --last 10m --style compact \
+  --predicate 'subsystem == "com.github.openmac.KeepAudioAlive" AND category == "Audio"'
+```
 
 ## Reproduce
 
