@@ -3,6 +3,20 @@ import Foundation
 @main
 struct StreamHealthTests {
     static func main() {
+        var sleep = SleepState()
+        sleep.willSleep()
+        precondition(sleep.sleeping)
+        precondition(sleep.explicitStart())
+        precondition(!sleep.sleeping)
+        precondition(!sleep.explicitStart(), "Repeated Start must preserve late-wake marker")
+        precondition(!sleep.didWake(), "Late wake must not recreate manually resumed stream")
+        sleep.willSleep()
+        precondition(sleep.didWake(), "Next sleep cycle must recover normally")
+        precondition(!sleep.sleeping)
+        sleep.willSleep()
+        _ = sleep.explicitStart()
+        sleep.willSleep()
+        precondition(sleep.didWake(), "A new sleep must invalidate the manual-resume marker")
         var startup = StreamHealth(now: 0)
         precondition(startup.observe(count: 0, now: 4.9) == .waiting)
         precondition(startup.observe(count: 0, now: 5) == .stalled)
@@ -40,6 +54,6 @@ struct StreamHealthTests {
         for _ in 0..<1000 { KMAHeartbeatTick(heartbeat) }
         precondition(KMAHeartbeatRead(heartbeat) == 1000)
         KMAHeartbeatDestroy(heartbeat)
-        print("PASS: startup grace, callback stall, sustained health, replacement, wraparound, retry budget, atomic heartbeat")
+        print("PASS: sleep/manual-start/late-wake policy, startup grace, callback stall, sustained health, replacement, wraparound, retry budget, atomic heartbeat")
     }
 }

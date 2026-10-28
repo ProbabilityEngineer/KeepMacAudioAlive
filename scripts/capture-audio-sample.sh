@@ -18,22 +18,4 @@ if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-destination="$HOME/Downloads/KeepMacAudioAlive-diagnostics/$(date '+%Y%m%d-%H%M%S')-$$"
-mkdir -p "$destination"
-echo "Sampling PID $pid for 5 seconds; output: $destination"
-/usr/bin/sample "$pid" 5 -file "$destination/process-sample.txt"
-
-# Sandboxed builds use the container home; unsigned development builds may not.
-for root in \
-    "$HOME/Library/Containers/com.github.openmac.KeepAudioAlive/Data/Library/Logs/KeepMacAudioAlive" \
-    "$HOME/Library/Logs/KeepMacAudioAlive"; do
-    if [[ -d "$root" ]]; then
-        label="unsandboxed"
-        [[ "$root" == *"/Containers/"* ]] && label="sandboxed"
-        mkdir -p "$destination/$label"
-        for file in "$root"/lifecycle*.log; do
-            [[ -f "$file" ]] && cp "$file" "$destination/$label/"
-        done
-    fi
-done
-echo "Saved sample and available lifecycle logs to $destination"
+exec python3 "$(dirname "$0")/capture-audio-sample.py" "$pid"

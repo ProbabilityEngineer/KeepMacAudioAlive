@@ -227,6 +227,29 @@ Supersedes the expandable-settings and always-hidden-login behaviour above:
 - Settings/Quit remain in the application menu (Dock modes) and optional status
   menu. With Neither selected, neither menu is visibly available.
 
+### Delayed workspace wake notification: confirmed and addressed
+
+- Captured October 28 logs show explicit Start at 07:50:20.535, but the app's
+  Sleeping gate prevented initialization until didWake at 07:50:41.621.
+  AudioDeviceStart then completed in about 57 ms; callback confirmation followed
+  about 1.2 seconds later. This capture does not support a blocked CoreAudio call
+  as the cause of that long spinner.
+- Explicit user Start now clears the stale sleep gate. A late didWake for that
+  cycle preserves the current stream/recovery instead of tearing it down again.
+  A subsequent willSleep resets this override for the next real sleep cycle.
+- Automatic recovery without user interaction still relies on workspace wake
+  delivery; an earlier reliable automatic wake signal remains future work.
+- Stop in the same capture completed AudioDeviceStop and IOProc destruction
+  successfully in milliseconds. Continued physical quiet after teardown is
+  not evidence that this process was still producing callbacks.
+- Capture script now samples in consecutive chunks until five seconds after a
+  NEW callback-confirmed Started entry for the selected PID, with a 90-second
+  overall deadline, then copies final logs. It tolerates log rotation and ignores
+  pre-existing entries. It does not restart audio or change Bluetooth settings.
+- Sleep-state policy tests, log-watcher tests, existing stream/termination tests,
+  and Debug build pass. Trackball freeze cause and physical recovery timing
+  remain unverified until the next user test.
+
 ## Validation strategy
 
 - Build after each milestone and review diagnostics.

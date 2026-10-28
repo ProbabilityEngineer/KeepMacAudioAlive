@@ -1,6 +1,6 @@
 # Sleep/wake diagnostics
 
-The diagnostic build records events without changing recovery behaviour.
+The app records lifecycle events continuously.
 It does not sample automatically, prevent sleep, or change Bluetooth settings.
 
 ## Reproduce
@@ -8,20 +8,27 @@ It does not sample automatically, prevent sleep, or change Bluetooth settings.
 1. Quit the previous app and open the new build. Keep SoX stopped.
 2. At a safe time, sleep and wake with the dock attached.
 3. Note roughly when the trackball freezes and when the hum stops.
-4. While status remains Sleeping (or during the freeze if possible), run:
+4. Before pressing Start after wake (or while still spinning), run:
 
    ```sh
    bash scripts/capture-audio-sample.sh
    ```
 
    Run from the repository directory. If multiple instances are running, pass
-   the desired PID as an argument. Sampling takes five seconds and saves its
-   report and available logs under `~/Downloads/KeepMacAudioAlive-diagnostics/`.
+   the desired PID as an argument. The script requires Python 3. It captures
+   consecutive short samples, watches only newly appended log entries for that
+   PID's callback-confirmed Started event, then captures five additional seconds.
+   The current sample may run a little longer to finish its report. A 90-second
+   overall limit prevents indefinite capture if no Started event arrives.
+   Reports and final logs go under `~/Downloads/KeepMacAudioAlive-diagnostics/`.
    Sampling adds diagnostic overhead; it should not be left running continuously.
    Alternatively use Activity Monitor → select the app → Sample Process.
 
-5. After recovery completes, retain the current lifecycle log too: the script's
-   snapshot might precede completion of the blocked operation.
+5. Let the script finish. It copies logs after sampling rather than before
+   recovery. Check `capture.txt` for the recovery event or timeout reason.
+   If recovery happened before capture started, it deliberately ignores that
+   old event and will time out unless another recovery occurs.
+6. Compare a cycle without sampling afterward, since profiling adds overhead.
 
 ## Log locations
 

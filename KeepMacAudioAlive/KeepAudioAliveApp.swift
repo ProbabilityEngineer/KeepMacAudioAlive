@@ -205,6 +205,31 @@ nonisolated struct RecoveryBudget {
     }
 }
 
+nonisolated struct SleepState {
+    private(set) var sleeping = false
+    private var resumedByUser = false
+
+    mutating func willSleep() {
+        sleeping = true
+        resumedByUser = false
+    }
+
+    mutating func explicitStart() -> Bool {
+        guard sleeping else { return false }
+        sleeping = false
+        resumedByUser = true
+        return true
+    }
+
+    // False means an explicit Start already handled this sleep cycle.
+    mutating func didWake() -> Bool {
+        sleeping = false
+        let recreate = !resumedByUser
+        resumedByUser = false
+        return recreate
+    }
+}
+
 // All mutable lifecycle state below is owned by queue. The render callback never
 // touches it. Nonisolated opts out of this project's default MainActor isolation.
 nonisolated private final class AudioController: @unchecked Sendable {
@@ -213,7 +238,8 @@ nonisolated private final class AudioController: @unchecked Sendable {
     private var listener: AudioObjectPropertyListenerBlock?
     private var uid: String?
     private var enabled = true
-    private var sleeping = false
+    private var sleepState = SleepState()
+    private var sleeping: Bool { sleepState.sleeping }
     private var closed = false
     private var devices: [AudioEngine.AudioDevice] = []
     private var stream: (device: AudioDeviceID, uid: String, proc: AudioDeviceIOProcID,
@@ -266,6 +292,9 @@ nonisolated private final class AudioController: @unchecked Sendable {
         queue.async {
             guard !self.closed else { return }
             self.enabled = enabled
+            if enabled && self.sleepState.explicitStart() {
+                DiagnosticLog.event("Explicit Start cleared stale sleep state")
+            }
             self.invalidateRetries()
             self.reconcile()
         }
@@ -278,7 +307,13 @@ nonisolated private final class AudioController: @unchecked Sendable {
             DiagnosticLog.event("HANDLE sleeping=\(sleeping) queueWait=\(received.duration(to: .now))")
             defer { DiagnosticLog.event("HANDLED sleeping=\(sleeping) total=\(received.duration(to: .now))") }
             guard !self.closed else { return }
-            self.sleeping = sleeping
+            if sleeping {
+                self.sleepState.willSleep()
+            } else if !self.sleepState.didWake() {
+                DiagnosticLog.event("Late wake after explicit Start; preserving current stream/recovery")
+                if self.retry == nil { self.reconcile() }
+                return
+            }
             self.invalidateRetries()
             // Always discard pre-sleep ownership, even if willSleep was missed.
             self.publish(sleeping ? "Sleeping" : "Waking", running: false)
